@@ -35,6 +35,7 @@ import subprocess
 import sys
 import threading
 import time
+from urllib.parse import urlsplit
 from pathlib import Path
 from typing import AsyncIterator, Optional
 
@@ -76,11 +77,34 @@ def normalise_remote_url(raw: Optional[str]) -> Optional[str]:
     if not url:
         return None
     if not re.match(r"^https?://", url, re.IGNORECASE):
-        raise ValueError(f"MINICPM_REMOTE_URL must start with http:// or https://: {url!r}")
+        raise ValueError("MINICPM_REMOTE_URL must start with http:// or https://")
+    parts = urlsplit(url)
+    if parts.username is not None or parts.password is not None:
+        # The URL is logged, put in error messages and reported by /api/health;
+        # a password in it would leak. Keys go in MINICPM_REMOTE_API_KEY.
+        raise ValueError("MINICPM_REMOTE_URL must not contain user:password@; use MINICPM_REMOTE_API_KEY")
+    if parts.query or parts.fragment:
+        raise ValueError("MINICPM_REMOTE_URL must not contain a query or fragment")
     url = url.rstrip("/")
     if url.lower().endswith("/v1"):
         url = url[:-3].rstrip("/")
     return url
+
+
+def _env_float(name: str, default: float) -> float:
+    """A float from the environment; the default (with a warning) when it is
+    missing or not a finite number, rather than failing at start-up."""
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+        if value != value or value in (float("inf"), float("-inf")):
+            raise ValueError(raw)
+        return value
+    except ValueError:
+        get_logger().warning("%s=%r is not a number; using %s", name, raw, default)
+        return default
 
 
 def _normalise_device(raw: Optional[str] = None) -> str:
@@ -244,7 +268,7 @@ class LlamaServer:
         )
         self.remote_model: Optional[str] = (os.environ.get("MINICPM_REMOTE_MODEL") or "").strip() or None
         self._remote_api_key: Optional[str] = (os.environ.get("MINICPM_REMOTE_API_KEY") or "").strip() or None
-        self._remote_wait: float = float(os.environ.get("MINICPM_REMOTE_WAIT") or 10.0)
+        self._remote_wait: float = _env_float("MINICPM_REMOTE_WAIT", 10.0)
         self.model_path: Optional[Path] = Path(model_path).expanduser().resolve() if model_path else None
         self.ctx_size = int(ctx_size)
         self.n_gpu_layers = int(n_gpu_layers)

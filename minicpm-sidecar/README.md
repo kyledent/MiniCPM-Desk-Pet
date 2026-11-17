@@ -103,6 +103,12 @@ In remote mode:
 
 The proxy environment is ignored for the remote connection (`trust_env=False`), as the Electron host already does for local mode.
 
+Security notes for remote mode:
+
+- `MINICPM_REMOTE_URL` may not contain `user:password@`, a query or a fragment: the URL is logged and reported by `/api/health`. Put a key in `MINICPM_REMOTE_API_KEY`, which is never logged.
+- Requests from real web origins (`Origin: http(s)://...`) get 403, so a web page open in a local browser cannot use the remote model through the gateway. The pet's own renderer (a `file://` page) and its main process are unaffected. Local mode keeps the upstream CORS policy.
+- `--host` other than loopback is refused unless `MINICPM_ALLOW_LAN=1`: other machines could otherwise use the remote model through this gateway.
+
 The installed desktop app adopts any gateway that already answers `/api/health` on `MINICPM_HOST:MINICPM_PORT` (default `127.0.0.1:18765`), so the gateway can be started by hand ahead of the app. Set `MINICPM_BACKEND=remote` for the app as well, so it skips the model-download onboarding:
 
 ```bat

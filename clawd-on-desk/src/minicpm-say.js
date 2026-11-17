@@ -15,8 +15,10 @@
 const SAY_FEATURE = "say";
 const SAY_CHAR_LIMIT = 140;
 
-// Control characters (C0 except tab/newline, DEL, C1) never reach the bubble.
-const CONTROL_RE = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g;
+// Control characters (C0 except tab/newline, DEL, C1) never reach the bubble,
+// nor do invisible formatting characters that can disguise text: zero-width
+// spaces / joiners, bidirectional overrides and isolates, the BOM.
+const CONTROL_RE = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F\u200B-\u200F\u202A-\u202E\u2060-\u2069\uFEFF]/g;
 
 function sayText(data, limit = SAY_CHAR_LIMIT) {
   if (!data || typeof data !== "object" || typeof data.say !== "string") return "";

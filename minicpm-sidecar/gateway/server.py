@@ -339,6 +339,19 @@ def build_app(
                 bridge.close()
 
     app = FastAPI(title="MiniCPM Sidecar Gateway", lifespan=lifespan)
+
+    if server.remote:
+        # Remote mode puts a (possibly keyed) remote model behind this gateway.
+        # The upstream CORS policy allows any origin, so any web page open in a
+        # local browser could use it. The pet's own renderer is a file:// page
+        # (Origin "null" or "file://") and Electron's main process sends no
+        # Origin; refuse requests from real web origins (http/https).
+        @app.middleware("http")
+        async def _refuse_web_origins(request, call_next):
+            origin = (request.headers.get("origin") or "").strip().lower()
+            if origin.startswith("http://") or origin.startswith("https://"):
+                return JSONResponse({"error": "web origins are not accepted in remote mode"}, status_code=403)
+            return await call_next(request)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],

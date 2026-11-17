@@ -89,6 +89,16 @@ def _resolve_parent_pid() -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(list(sys.argv[1:] if argv is None else argv))
+    # Remote mode relays to a (possibly keyed) remote model: only serve it
+    # beyond this machine when explicitly allowed.
+    if (os.environ.get("MINICPM_REMOTE_URL") or "").strip() and args.host not in ("127.0.0.1", "localhost", "::1") \
+            and os.environ.get("MINICPM_ALLOW_LAN") != "1":
+        print(
+            f"refusing --host {args.host} in remote mode: other machines could use the remote model "
+            "through this gateway. Set MINICPM_ALLOW_LAN=1 to allow it.",
+            file=sys.stderr,
+        )
+        return 2
     init_logging()
     install_broken_pipe_guard()
 
@@ -100,6 +110,7 @@ def main(argv: list[str] | None = None) -> int:
     ParentWatchdog(parent_pid).start()
 
     model_path = _resolve_model_arg(args.model)
+
 
     app = build_app(
         initial_model=model_path,

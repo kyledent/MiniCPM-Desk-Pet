@@ -25,6 +25,10 @@ describe("sayText", () => {
     assert.strictEqual(sayText({ say: "a\u009Bb\u007Fc" }), "abc");
   });
 
+  it("drops invisible formatting characters that can disguise text", () => {
+    assert.strictEqual(sayText({ say: "pay\u200Bpal \u202Egnp.exe\u202C ok\uFEFF" }), "paypal gnp.exe ok");
+  });
+
   it("caps long text with an ellipsis, counting code points", () => {
     const long = "x".repeat(SAY_CHAR_LIMIT + 20);
     const out = sayText({ say: long });

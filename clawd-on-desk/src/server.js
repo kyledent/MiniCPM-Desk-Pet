@@ -21,6 +21,7 @@ const {
   sendStateHealthResponse,
   handleStatePost,
 } = require("./server-route-state");
+const { isBrowserRequest, rejectBrowserRequest } = require("./local-request-guard");
 const {
   handlePermissionPost,
   shouldBypassCCBubble,
@@ -246,6 +247,9 @@ function startHttpServer() {
   httpServer = createHttpServer((req, res) => {
     if (req.method === "GET" && req.url === "/state") {
       sendStateHealthResponse(res, { getHookServerPort });
+    } else if (req.method === "POST" && isBrowserRequest(req)) {
+      // A web page in a local browser, not an agent hook (see local-request-guard.js).
+      rejectBrowserRequest(res);
     } else if (req.method === "POST" && req.url === "/state") {
       handleStatePost(req, res, {
         ctx,
