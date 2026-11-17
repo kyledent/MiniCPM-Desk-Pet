@@ -1,6 +1,7 @@
 "use strict";
 
 const path = require("path");
+const { SAY_FEATURE } = require("./minicpm-say");
 const {
   CLAWD_SERVER_HEADER,
   CLAWD_SERVER_ID,
@@ -84,7 +85,8 @@ function normalizeContextUsage(value) {
 }
 
 function sendStateHealthResponse(res, options) {
-  const body = JSON.stringify({ ok: true, app: CLAWD_SERVER_ID, port: options.getHookServerPort() });
+  // `features` lets clients detect optional capabilities (see minicpm-say.js).
+  const body = JSON.stringify({ ok: true, app: CLAWD_SERVER_ID, port: options.getHookServerPort(), features: [SAY_FEATURE] });
   res.writeHead(200, {
     "Content-Type": "application/json",
     [CLAWD_SERVER_HEADER]: CLAWD_SERVER_ID,

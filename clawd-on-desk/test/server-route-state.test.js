@@ -93,6 +93,7 @@ describe("server-route-state health", () => {
       ok: true,
       app: CLAWD_SERVER_ID,
       port: 23334,
+      features: ["say"],
     });
   });
 });

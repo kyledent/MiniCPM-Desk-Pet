@@ -33,6 +33,7 @@ const fs = require("fs");
 const http = require("http");
 const os = require("os");
 const path = require("path");
+const { sayText } = require("./minicpm-say");
 
 const isMac = process.platform === "darwin";
 const isWin = process.platform === "win32";
@@ -1824,6 +1825,7 @@ module.exports = function initMinicpmChat(ctx) {
     if (typeof data.session_title === "string" && data.session_title.trim()) s += 10;
     if (typeof data.last_summary === "string" && data.last_summary.trim()) s += 10;
     if (typeof data.assistant_last_output === "string" && data.assistant_last_output.trim()) s += 10;
+    if (sayText(data)) s += 30;  // verbatim text beats anything we would narrate
     if (data.agent_id === "cursor-agent") s += 1;  // tie-breaker
     return s;
   }
@@ -1843,7 +1845,9 @@ module.exports = function initMinicpmChat(ctx) {
     if (!data || typeof data !== "object") return;
     const event = String(data.event || "");
     const sessionId = String(data.session_id || "");
-    if (!NARRATE_EVENTS.has(event)) return;
+    // A verbatim `say` is shown whatever the event; otherwise only the
+    // agent-completion events are narrated.
+    if (!NARRATE_EVENTS.has(event) && !sayText(data)) return;
     if (sessionId.startsWith(NARRATE_IGNORE_SESSION_PREFIX)) return;
 
     const now = Date.now();
@@ -1982,34 +1986,12 @@ module.exports = function initMinicpmChat(ctx) {
     narrating = true;
     lastNarrateAt = Date.now();
     try {
-      const prompt = buildNarrationPrompt(data);
-      log(`[narrator] dispatch event=${data.event} agent=${data.agent_id} prompt=${JSON.stringify(prompt.user)}`);
-      const body = JSON.stringify({
-        messages: [{ role: "user", content: prompt.user }],
-        system: prompt.system,
-        stream: false,
-        max_new_tokens: 50,
-        thinking: false,
-        temperature: 0.7,
-        top_p: 0.9,
-        repetition_penalty: 1.15,
-        silent: true,            // don't push pet animation states for narrator
-        disable_adapter: true,   // bypass persona LoRA — narration must be functional/informative
-      });
-      const r = await httpJson("POST", `${sidecar.baseUrl()}/api/chat`, JSON.parse(body), 30000);
-      let text = (r.json && (r.json.content || "")).trim();
-      // Strip "回复：" prefix the few-shot format may leak.
-      text = text.replace(/^(回复[:：]\s*)/, "");
-      // First line only — multi-line responses become "thoughts" we don't
-      // want to drop into a small bubble.
-      text = text.split(/\r?\n/)[0].trim();
-      // Strip surrounding quote characters (some models love quoting the reply).
-      text = text.replace(/^[「『"']+|[」』"']+$/g, "").trim();
-      // Cap to first sentence + ≤50 chars total. Rich enough to convey a
-      // concrete result, short enough to fit the bubble at one glance.
-      const firstStop = text.search(/[。！？!?]/);
-      if (firstStop > 0 && firstStop < text.length - 1) text = text.slice(0, firstStop + 1);
-      if (text.length > 50) text = text.slice(0, 49) + "…";
+      let text = sayText(data);
+      if (text) {
+        log(`[narrator] say (verbatim) event=${data.event} agent=${data.agent_id}: ${text}`);
+      } else {
+        text = await narrateWithModel(data);
+      }
       if (!text) {
         log("[narrator] empty reply, skipping");
         return;
@@ -2045,6 +2027,40 @@ module.exports = function initMinicpmChat(ctx) {
         setTimeout(() => onStateEvent(q.data), 1500);
       }
     }
+  }
+
+  // Ask the model for a one-line narration of an agent event (the
+  // original behaviour). Returns "" when it has nothing usable.
+  async function narrateWithModel(data) {
+    const prompt = buildNarrationPrompt(data);
+    log(`[narrator] dispatch event=${data.event} agent=${data.agent_id} prompt=${JSON.stringify(prompt.user)}`);
+    const body = JSON.stringify({
+      messages: [{ role: "user", content: prompt.user }],
+      system: prompt.system,
+      stream: false,
+      max_new_tokens: 50,
+      thinking: false,
+      temperature: 0.7,
+      top_p: 0.9,
+      repetition_penalty: 1.15,
+      silent: true,            // don't push pet animation states for narrator
+      disable_adapter: true,   // bypass persona LoRA — narration must be functional/informative
+    });
+    const r = await httpJson("POST", `${sidecar.baseUrl()}/api/chat`, JSON.parse(body), 30000);
+    let text = (r.json && (r.json.content || "")).trim();
+    // Strip "回复：" prefix the few-shot format may leak.
+    text = text.replace(/^(回复[:：]\s*)/, "");
+    // First line only — multi-line responses become "thoughts" we don't
+    // want to drop into a small bubble.
+    text = text.split(/\r?\n/)[0].trim();
+    // Strip surrounding quote characters (some models love quoting the reply).
+    text = text.replace(/^[「『"']+|[」』"']+$/g, "").trim();
+    // Cap to first sentence + ≤50 chars total. Rich enough to convey a
+    // concrete result, short enough to fit the bubble at one glance.
+    const firstStop = text.search(/[。！？!?]/);
+    if (firstStop > 0 && firstStop < text.length - 1) text = text.slice(0, firstStop + 1);
+    if (text.length > 50) text = text.slice(0, 49) + "…";
+    return text;
   }
 
   function setNarrationEnabled(value) {
