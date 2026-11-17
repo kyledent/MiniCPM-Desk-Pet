@@ -233,3 +233,56 @@ def test_health_and_onboarding_report_remote(monkeypatch, tmp_path):
         o = client.get("/api/onboarding").json()
         assert o["model_present"] is True
         assert o["stage_hint"] == "ready"
+
+
+# ── security hardening (review findings F5 / F6) ────────────────────
+
+@pytest.mark.parametrize("raw", [
+    "http://user:s3cretpw@h:8080", "http://s3cretpw@h:8080/v1", "http://h:8080/v1?key=s3cretpw", "http://h:8080/#s3cretpw",
+])
+def test_remote_url_rejects_credentials_query_fragment(raw):
+    with pytest.raises(ValueError) as ei:
+        normalise_remote_url(raw)
+    assert "s3cretpw" not in str(ei.value)
+
+
+def test_malformed_remote_wait_falls_back(monkeypatch):
+    monkeypatch.setenv("MINICPM_REMOTE_WAIT", "soon")
+    srv = LlamaServer(model_path=None, remote_url="http://h:1")
+    assert srv._remote_wait == 10.0
+    monkeypatch.setenv("MINICPM_REMOTE_WAIT", "inf")
+    assert LlamaServer(model_path=None, remote_url="http://h:1")._remote_wait == 10.0
+
+
+def test_remote_mode_refuses_web_origins(monkeypatch, tmp_path):
+    monkeypatch.setenv("MINICPM_REMOTE_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("MINICPM_REMOTE_MODEL", "m")
+    monkeypatch.setenv("MINICPM_REMOTE_WAIT", "0")
+    monkeypatch.setenv("MINICPM_ADAPTER_DIR", str(tmp_path / "adapters"))
+    monkeypatch.setattr(server_mod.ClawdBridge, "post", lambda *a, **k: None)
+    app = server_mod.build_app(initial_model=None)
+    with TestClient(app) as client:
+        assert client.get("/api/health", headers={"Origin": "https://evil.example"}).status_code == 403
+        assert client.post("/api/chat", json={"messages": [{"role": "user", "content": "x"}]},
+                           headers={"Origin": "http://evil.example"}).status_code == 403
+        # The pet's renderer (file:// page) and its main process (no Origin) still work.
+        assert client.get("/api/health", headers={"Origin": "null"}).status_code == 200
+        assert client.get("/api/health", headers={"Origin": "file://"}).status_code == 200
+        assert client.get("/api/health").status_code == 200
+
+
+def test_local_mode_cors_unchanged(monkeypatch, tmp_path):
+    monkeypatch.delenv("MINICPM_REMOTE_URL", raising=False)
+    monkeypatch.setenv("MINICPM_ADAPTER_DIR", str(tmp_path / "adapters"))
+    monkeypatch.setattr(server_mod.ClawdBridge, "post", lambda *a, **k: None)
+    app = server_mod.build_app(initial_model=None)
+    with TestClient(app) as client:
+        assert client.get("/api/health", headers={"Origin": "https://example.org"}).status_code == 200
+
+
+def test_remote_mode_refuses_lan_host_without_opt_in(monkeypatch, capsys):
+    from gateway import __main__ as entry
+    monkeypatch.setenv("MINICPM_REMOTE_URL", "http://127.0.0.1:9")
+    monkeypatch.delenv("MINICPM_ALLOW_LAN", raising=False)
+    assert entry.main(["--host", "0.0.0.0", "--port", "18799"]) == 2
+    assert "MINICPM_ALLOW_LAN" in capsys.readouterr().err
