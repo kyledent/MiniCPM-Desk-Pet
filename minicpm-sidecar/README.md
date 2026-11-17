@@ -80,6 +80,36 @@ uv sync
 
 或者直接走仓库根的 `./go.sh`（已改造为新流程）。
 
+## Remote LLM mode (fork addition)
+
+The gateway can use an OpenAI-compatible server that is already running
+elsewhere (a `llama-server` or vLLM on another machine) instead of spawning
+`llama-server` itself. Local mode stays the default; remote mode is opt-in.
+
+| Variable | Meaning |
+|---|---|
+| `MINICPM_REMOTE_URL` | Base URL of the server, e.g. `http://100.64.0.10:8080` (a trailing `/v1` is accepted). Setting it turns remote mode on. |
+| `MINICPM_REMOTE_MODEL` | Model id to request. Default: the first id from `GET /v1/models` (vLLM needs the exact id; llama-server ignores it). |
+| `MINICPM_REMOTE_API_KEY` | Optional; sent as `Authorization: Bearer ...`. Nothing is sent when unset. |
+| `MINICPM_REMOTE_WAIT` | Seconds to wait for the server at start-up (default 10). A server that is not up yet is not an error: chat reports the server's error until it answers. |
+
+In remote mode:
+
+- nothing is spawned, and the local llama-server pid file is left alone;
+- `/api/health` reports `"backend": "remote"`, `remote_url` and the model id, and `/api/onboarding` reports the model as present, so the app never offers the model download;
+- warm-up uses `/v1/completions`, which llama-server and vLLM both serve (`/completion` is llama-server only);
+- chat sends `repetition_penalty` alongside llama.cpp's `repeat_penalty`;
+- LoRA adapters and `/api/load-model` swaps are local-only and are ignored, with a log warning.
+
+The proxy environment is ignored for the remote connection (`trust_env=False`), as the Electron host already does for local mode.
+
+The installed desktop app adopts any gateway that already answers `/api/health` on `MINICPM_HOST:MINICPM_PORT` (default `127.0.0.1:18765`), so the gateway can be started by hand ahead of the app. Set `MINICPM_BACKEND=remote` for the app as well, so it skips the model-download onboarding:
+
+```bat
+set MINICPM_REMOTE_URL=http://100.64.0.10:8080
+python -m gateway --port 18765
+```
+
 ## 生产构建
 
 ```bash

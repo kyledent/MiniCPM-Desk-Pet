@@ -309,7 +309,7 @@ def build_app(
     # new path on /api/load-adapter {path:<gguf>}. The Electron host
     # is responsible for writing the latest choice back to its prefs
     # file so the next sidecar spawn boots into the same state.
-    state: dict[str, Optional[Path]] = {"current_adapter": initial_active}
+    state: dict[str, Optional[Path]] = {"current_adapter": None if server.remote else initial_active}
     startup_error: Optional[str] = None
 
     @asynccontextmanager
@@ -319,7 +319,7 @@ def build_app(
         # downloads it via /api/update-apply and only then calls
         # /api/load-model. The pet still wants /api/health to answer 200
         # in the meantime so the bubble doesn't show a permanent error.
-        if initial_model and Path(initial_model).exists():
+        if server.remote or (initial_model and Path(initial_model).exists()):
             try:
                 await server.start()
                 startup_error = None
@@ -383,12 +383,14 @@ def build_app(
         return {
             "ok": True,
             "alive": server.alive,
-            "backend": "llama.cpp",
+            "backend": "remote" if server.remote else "llama.cpp",
+            "remote_url": server.remote_url,
             "accel": current,
             "device": current,  # alias used by older Electron code paths
             "dtype": "gguf",
             "model_dir": str(server.model_path) if server.model_path else None,
-            "model_name": server.model_path.name if server.model_path else None,
+            "model_name": (server.remote_model if server.remote
+                           else server.model_path.name if server.model_path else None),
             "adapter": str(adapter) if adapter else None,
             "persona": _persona_for(adapter) if adapter else "default",
             "llama_server": sub_health,
@@ -424,7 +426,9 @@ def build_app(
     @app.get("/api/onboarding")
     def onboarding():
         path = server.model_path or _get_active_model_path()
-        present = path.exists() if path else False
+        # Remote mode: the model lives on the remote server, so there is
+        # nothing to download here.
+        present = True if server.remote else (path.exists() if path else False)
         adapter = state["current_adapter"]
         backend = detect_backend()
         return {

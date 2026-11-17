@@ -10,6 +10,15 @@ Owns the lifecycle of a single `llama-server` child:
 
 The gateway HTTP layer (server.py) calls only the methods exposed here;
 nothing else in the codebase should touch llama-server directly.
+
+Remote mode (opt-in): set ``MINICPM_REMOTE_URL`` to the base URL of an
+already-running OpenAI-compatible server (a llama-server or vLLM on
+another machine, e.g. ``http://100.x.y.z:8080``). Nothing is spawned;
+the same client methods talk to that server instead. Optional:
+``MINICPM_REMOTE_MODEL`` (model name to request; default: the first id
+from ``/v1/models``), ``MINICPM_REMOTE_API_KEY`` (sent as a Bearer token),
+``MINICPM_REMOTE_WAIT`` (seconds to wait for it at start, default 10).
+LoRA adapters and model swaps are local-only and are ignored remotely.
 """
 
 from __future__ import annotations
@@ -18,6 +27,7 @@ import asyncio
 import json
 import os
 import platform
+import re
 import shutil
 import signal
 import socket
@@ -54,6 +64,23 @@ def _find_free_port(start: int = 18766, end: int = 18800) -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+def normalise_remote_url(raw: Optional[str]) -> Optional[str]:
+    """Return the server root for an OpenAI-compatible base URL, or None.
+
+    Accepts ``http://host:port``, ``http://host:port/`` and
+    ``http://host:port/v1`` alike, so users can paste whichever form
+    their server's docs print. Only http(s) URLs are accepted."""
+    url = (raw or "").strip()
+    if not url:
+        return None
+    if not re.match(r"^https?://", url, re.IGNORECASE):
+        raise ValueError(f"MINICPM_REMOTE_URL must start with http:// or https://: {url!r}")
+    url = url.rstrip("/")
+    if url.lower().endswith("/v1"):
+        url = url[:-3].rstrip("/")
+    return url
 
 
 def _normalise_device(raw: Optional[str] = None) -> str:
@@ -207,7 +234,17 @@ class LlamaServer:
         threads: Optional[int] = None,
         extra_args: Optional[list[str]] = None,
         adapters: Optional[list[Path]] = None,
+        remote_url: Optional[str] = None,
     ) -> None:
+        # Remote mode: talk to an existing OpenAI-compatible server
+        # instead of spawning llama-server. Explicit argument wins over
+        # the environment so tests can pin it either way.
+        self.remote_url: Optional[str] = normalise_remote_url(
+            remote_url if remote_url is not None else os.environ.get("MINICPM_REMOTE_URL")
+        )
+        self.remote_model: Optional[str] = (os.environ.get("MINICPM_REMOTE_MODEL") or "").strip() or None
+        self._remote_api_key: Optional[str] = (os.environ.get("MINICPM_REMOTE_API_KEY") or "").strip() or None
+        self._remote_wait: float = float(os.environ.get("MINICPM_REMOTE_WAIT") or 10.0)
         self.model_path: Optional[Path] = Path(model_path).expanduser().resolve() if model_path else None
         self.ctx_size = int(ctx_size)
         self.n_gpu_layers = int(n_gpu_layers)
@@ -221,6 +258,10 @@ class LlamaServer:
         self.adapter_paths: list[Path] = [
             Path(p).expanduser().resolve() for p in (adapters or [])
         ]
+        if self.remote_url:
+            # Adapters are files on THIS machine; a remote server can't
+            # load them. Per-request `lora` ids would point at nothing.
+            self.adapter_paths = []
         self._adapter_index: dict[Path, int] = {}
         self.host = "127.0.0.1"
         self.port: int = 0
@@ -279,7 +320,71 @@ class LlamaServer:
         argv += self.extra_args
         return argv
 
+    @property
+    def remote(self) -> bool:
+        return bool(self.remote_url)
+
+    async def _start_remote(self) -> None:
+        """Remote mode: open a client to the configured server and wait
+        briefly for it. A server that is not up yet is NOT an error -- a
+        scheduled job may still be starting -- chat simply fails with the
+        server's error until it answers, then works without a restart."""
+        log = get_logger()
+        with self._swap_lock:
+            if self._client is not None:
+                return
+            headers = {}
+            if self._remote_api_key:
+                headers["Authorization"] = f"Bearer {self._remote_api_key}"
+            self._client = httpx.AsyncClient(
+                base_url=self.remote_url,
+                headers=headers,
+                timeout=httpx.Timeout(connect=5.0, read=None, write=30.0, pool=5.0),
+                # The Electron host strips proxy variables before spawning
+                # us; do the same for a hand-started gateway so a site
+                # proxy never intercepts tailnet / LAN traffic.
+                trust_env=False,
+            )
+        log.info("remote mode: using %s (nothing spawned)", self.remote_url)
+        deadline = time.monotonic() + max(0.0, self._remote_wait)
+        while True:
+            if await self.health() is not None:
+                log.info("remote server ready: %s model=%s", self.remote_url, self.remote_model)
+                return
+            if time.monotonic() >= deadline:
+                log.warning("remote server %s not answering yet; will retry on use", self.remote_url)
+                return
+            await asyncio.sleep(1.0)
+
+    async def _remote_health(self) -> Optional[dict]:
+        """Probe /health (llama-server) then /v1/models (any OpenAI-
+        compatible server, vLLM included). Fills in `remote_model` from
+        /v1/models when the user didn't name one."""
+        client = self._client
+        if client is None:
+            return None
+        try:
+            r = await client.get("/health", timeout=3.0)
+            if r.status_code == 200 and self.remote_model:
+                return {"status": "ok", "remote": self.remote_url, "model": self.remote_model}
+        except Exception:
+            pass
+        try:
+            r = await client.get("/v1/models", timeout=3.0)
+            if r.status_code != 200:
+                return None
+            data = (r.json() or {}).get("data") or []
+            ids = [str(m.get("id")) for m in data if isinstance(m, dict) and m.get("id")]
+            if not self.remote_model and ids:
+                self.remote_model = ids[0]
+            return {"status": "ok", "remote": self.remote_url, "model": self.remote_model, "models": ids}
+        except Exception:
+            return None
+
     async def start(self) -> None:
+        if self.remote:
+            await self._start_remote()
+            return
         log = get_logger()
         with self._swap_lock:
             if self._proc and self._proc.poll() is None:
@@ -398,6 +503,10 @@ class LlamaServer:
                 await client.aclose()
             except Exception:
                 pass
+        if self.remote:
+            # Nothing of ours to kill, and the pid file may belong to a
+            # local sidecar on this machine.
+            return
         if proc and proc.poll() is None:
             try:
                 if platform.system() == "Windows":
@@ -423,6 +532,11 @@ class LlamaServer:
 
     async def swap_model(self, model_path: Path) -> None:
         """Restart llama-server with a different `--model`."""
+        if self.remote:
+            # The remote server owns its model; record the choice only.
+            get_logger().warning("remote mode: ignoring model swap to %s", model_path)
+            self.model_path = Path(model_path).expanduser().resolve()
+            return
         await self.stop()
         self.model_path = Path(model_path).expanduser().resolve()
         await self.start()
@@ -438,6 +552,9 @@ class LlamaServer:
         (~2-4s on M-series Metal), same order of magnitude as
         /api/load-model.
         """
+        if self.remote:
+            get_logger().warning("remote mode: LoRA adapters are not supported; ignoring %d", len(paths))
+            return
         new_paths = [Path(p).expanduser().resolve() for p in paths]
         # No-op fast path: same set in same order, nothing to do.
         if new_paths == self.adapter_paths:
@@ -503,9 +620,14 @@ class LlamaServer:
 
     @property
     def alive(self) -> bool:
+        if self.remote:
+            # "Configured and started"; reachability shows in health().
+            return self._client is not None
         return self._proc is not None and self._proc.poll() is None
 
     async def health(self) -> Optional[dict]:
+        if self.remote:
+            return await self._remote_health()
         if not self._client:
             return None
         try:
@@ -548,8 +670,10 @@ class LlamaServer:
         if not self._client:
             raise RuntimeError("llama-server client not initialised; did you await start()?")
 
+        if self.remote and not self.remote_model:
+            await self._remote_health()   # learn the model id lazily
         body = {
-            "model": "minicpm",
+            "model": (self.remote_model or "minicpm") if self.remote else "minicpm",
             "messages": messages,
             "stream": True,
             "max_tokens": int(max_tokens),
@@ -566,6 +690,11 @@ class LlamaServer:
         }
         if stop:
             body["stop"] = stop
+        if self.remote:
+            # vLLM spells it `repetition_penalty`; llama-server ignores
+            # the extra key. Per-request LoRA ids are meaningless remotely.
+            body["repetition_penalty"] = float(repetition_penalty)
+            lora = None
         # Per-request LoRA override (llama.cpp PR #10994). `lora=[]`
         # explicitly disables every pre-loaded adapter for THIS request
         # only — used by narration to bypass the persona without touching
@@ -578,7 +707,8 @@ class LlamaServer:
         async with self._client.stream("POST", "/v1/chat/completions", json=body) as resp:
             if resp.status_code != 200:
                 tail = (await resp.aread()).decode("utf-8", "ignore")[:500]
-                raise RuntimeError(f"llama-server /v1/chat/completions HTTP {resp.status_code}: {tail}")
+                who = f"remote server {self.remote_url}" if self.remote else "llama-server"
+                raise RuntimeError(f"{who} /v1/chat/completions HTTP {resp.status_code}: {tail}")
             async for raw_line in resp.aiter_lines():
                 if not raw_line:
                     continue
@@ -616,6 +746,20 @@ class LlamaServer:
         """Fire one tiny non-streaming completion. Used by /api/warmup."""
         if not self._client:
             raise RuntimeError("llama-server client not initialised; did you await start()?")
+        if self.remote:
+            # /completion is llama-server-only; /v1/completions is common
+            # to llama-server and vLLM.
+            if not self.remote_model:
+                await self._remote_health()
+            r = await self._client.post("/v1/completions", json={
+                "model": self.remote_model or "minicpm",
+                "prompt": prompt,
+                "max_tokens": int(max_tokens),
+                "temperature": float(temperature),
+                "stream": False,
+            })
+            r.raise_for_status()
+            return r.json()
         body = {
             "model": "minicpm",
             "prompt": prompt,
